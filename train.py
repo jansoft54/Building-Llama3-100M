@@ -6,6 +6,17 @@ import math
 from datasets import load_dataset
 from transformers import GPT2TokenizerFast
 from model import Llama3
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s: %(message)s',
+    handlers=[
+        logging.StreamHandler()  # Logs to stdout
+    ]
+)
+logger = logging.getLogger()
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 max_len = 256
@@ -53,7 +64,7 @@ group_size=4
 max_seq_len=256
 
 warmup = 100
-lr = 2.5e-4
+lr = 1e-4
 min_lr = 1e-6
 
 class InverseSquareRootLR(torch.optim.lr_scheduler._LRScheduler):
@@ -74,7 +85,7 @@ class InverseSquareRootLR(torch.optim.lr_scheduler._LRScheduler):
 
         return [lr for _ in self.base_lrs]
 
-epochs = 100
+epochs = 50
 
 model = Llama3(vocab_size=len(tokenizer),
                tokenizer=tokenizer,
@@ -89,8 +100,7 @@ optim = torch.optim.AdamW(model.parameters(),lr=lr,betas=(0.9, 0.98))
 lr_scheduler = InverseSquareRootLR(optim,warmup,lr,min_lr=min_lr)
 
 #train_set = tokenized_dataset['train']
-print(len(dataloader))
-print(f"Param. count: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+logger.info(f"Param. count: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 for epoch in range(epochs):
     for i,batch in enumerate(dataloader):
        
@@ -107,9 +117,8 @@ for epoch in range(epochs):
         lr_scheduler.step()
         optim.zero_grad()
 
+    logger.info(f"Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(dataloader)}], Loss: {loss.item():.4f}")
 
-
-    print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item()}")
    
 
 torch.save(model.state_dict(), 'best_model.pth')
