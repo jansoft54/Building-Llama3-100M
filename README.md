@@ -1,10 +1,10 @@
 
-<p align="center">
-  <img src="assets/llama3.webp" width="300" height="300" alt="Cute Llama">
-</p>
-
 ## Overview
 Llama3 is a Transformer-based language model that includes several advanced features like Rotary Position Embeddings (RoPE), multi-head grouped query attention, and key-value caching for efficient inference. The model is designed to be highly customizable, supporting options for flash attention, grouping, and adaptive feed-forward networks.
+
+<p align="center">
+  <img src="assets/llama3.webp" width="400" height="400" alt="Cute Llama">
+</p>
 
 ## Key Features
 - **Rotary Position Embedding (RoPE)**: The model utilizes RoPE to apply rotary positional encoding to input tensors, enhancing its capability to capture positional relationships.
