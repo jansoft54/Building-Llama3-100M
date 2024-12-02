@@ -24,13 +24,12 @@ class RoPE:
     return x_out.float()
 
 class FFN(nn.Module):
-  def __init__(self,d_model=256,multiple_of=2048):
+  def __init__(self,d_model=256,multiple_of=256):
     super(FFN, self).__init__()
     hidden = 4*d_model
     hidden = int(2*hidden/3)
 
     hidden = multiple_of*((hidden + multiple_of -1)//multiple_of)
-
     self.w1 = nn.Linear(d_model,hidden,bias=False)
     self.v = nn.Linear(d_model,hidden,bias=False)
     self.w2 = nn.Linear(hidden,d_model,bias=False)
@@ -41,12 +40,12 @@ class FFN(nn.Module):
 import math
 
 class KV_Cache(nn.Module):
-  def __init__(self, batch_size, seq_length, n_kv_heads, head_dim,dtype):
+  def __init__(self, batch_size, seq_length, n_kv_heads, head_dim):
     super(KV_Cache, self).__init__()
     device = 'cuda' 
     cache_shape = (batch_size, seq_length, n_kv_heads, head_dim)
-    self.register_buffer("cache_k", torch.zeros(cache_shape, dtype=dtype, device=device))
-    self.register_buffer("cache_v", torch.zeros(cache_shape, dtype=dtype, device=device))
+    self.cache_k = torch.zeros(cache_shape,  device=device)
+    self.cache_v = torch.zeros(cache_shape,  device=device)
 
   def update(self,xk,xv,pos):
     bx,seq_len = xk.shape[:2]
@@ -73,7 +72,7 @@ class MultiHeadGQAttention(nn.Module):
                              seq_length=max_seq_len,
                              n_kv_heads=self.heads//self.group_size,
                              head_dim=d_model // heads,
-                             dtype=torch.float32)
+    )
 
 
   def __repeat_kv(self,x):
@@ -86,6 +85,7 @@ class MultiHeadGQAttention(nn.Module):
     )
   def forward(self, q,k,v,mask,freq_cis,position=-1,):
     d_k = self.d_model // self.heads
+    bs,seq_len = q.shape[:2]
     q,k,v = self.W_q(q),self.W_k(k),self.W_v(v)
 
     q = q.view(q.shape[0],q.shape[1],self.heads,-1) # (batch,seq_len,heads,d_k) or (batch,1,heads,d_k)
@@ -106,24 +106,22 @@ class MultiHeadGQAttention(nn.Module):
   
 
     if MultiHeadGQAttention.flash:
-      q = q.contiguous()
-      k = k.contiguous()
-      v = v.contiguous()
+      q.contiguous()
+      k.contiguous()
+      v.contiguous()
       output = F.scaled_dot_product_attention(
-        q, k, v, None if mask is None else (mask==1).unsqueeze(1)
-        ).reshape(q.shape[0],-1,self.d_model)
+        q, k, v,attn_mask=(mask==1).unsqueeze(1)
+        ).transpose(1,2).reshape(bs,seq_len,-1)
     else:
-      res = torch.matmul(q,k.transpose(-2,-1))  /  math.sqrt(d_k)
-
+      scores = torch.matmul(q,k.transpose(-2,-1))  /  math.sqrt(d_k)
       if mask is not None:
         mask = mask.unsqueeze(1)
-        res = torch.masked_fill(res,mask==0,float('-inf'))
-
-        attention = nn.functional.softmax(res,dim=-1)
-
-        output = torch.matmul(attention,v).transpose(1,2).contiguous().view(q.shape[0],-1,self.d_model)
-    
+        scores = torch.masked_fill(scores,mask==0,float('-inf'))
+        attention = nn.functional.softmax(scores,dim=-1)
+        output = torch.matmul(attention,v).transpose(1,2).contiguous().view(bs,seq_len,-1)
+  
     output = self.W_o(output)
+    
 
 
     return output
@@ -145,7 +143,7 @@ class DecoderLayer(nn.Module):
 
   def forward(self,x,tgt_causal_mask,pos,freqs_cis):
     x_norm = self.norm1(x)
-    x = x + self.attention(x_norm,x_norm,x_norm,tgt_causal_mask,freqs_cis,position=pos)
+    x =  x + self.attention(x_norm,x_norm,x_norm,tgt_causal_mask,freqs_cis,position=pos)
     return x + self.ffn(self.norm2(x))
 
 class Llama3(nn.Module):
@@ -177,25 +175,28 @@ class Llama3(nn.Module):
     self.freqs_cis = RoPE.compute_freq(head_dim=d_model//heads,seq_len=max_seq_len)
     MultiHeadGQAttention.flash = use_flash
 
-  @staticmethod
-  def _build_masks(seq_len,attention_mask,device):
+  def _build_masks(self,seq_len,attention_mask,device,position=0):
     causal = torch.tril(torch.ones(seq_len,seq_len,dtype=torch.bool)).to(device).unsqueeze(0)
+    if not self.training:
+      i = torch.arange(seq_len).unsqueeze(1)    # Shape: (seqlen, 1)
+      j = torch.arange(position + seq_len).unsqueeze(0)  # Shape: (1, cache_len + seqlen)
+      return (j <= (position + i)).int().unsqueeze(0).to(device) 
     if attention_mask == None:
       return causal
     attention_mask = attention_mask.unsqueeze(1).repeat(1,seq_len,1).int()
     return (causal & attention_mask).int()
   @staticmethod
-  def gen_labels(labels,tokenizer,data_collator,pad_token_id=-100):
+  def gen_labels(labels,tokenizer,data_collator,ignore_index=-100):
     batch = data_collator(labels)
     labels = batch['labels']
     for i in range(labels.shape[0]):
       l = torch.roll(labels[i],-1)
-      target_indices = (l == pad_token_id).nonzero(as_tuple=True)[0]
+      target_indices = (l == ignore_index).nonzero(as_tuple=True)[0]
       if len(target_indices) == 0:
         l[-1] = tokenizer.eos_token_id
       else:
         seq_len = len(l) - len(target_indices) 
-        l[-1] = pad_token_id
+        l[-1] = ignore_index
         l[seq_len-1] = tokenizer.eos_token_id
       labels[i] = l
     batch['labels'] = labels
@@ -204,54 +205,55 @@ class Llama3(nn.Module):
     loss = nn.functional.cross_entropy(logits.view(-1,logits.shape[-1]),labels.view(-1),ignore_index=self.ignore_index)
     return loss
 
-  def generate(self,prompt,tokenizer,temp=1.0,top_k=None):
-    device = 'cuda' 
-    tokenized = tokenizer(prompt, max_length=self.max_seq_len,truncation=True)
-    tokens = torch.tensor(tokenized['input_ids']).unsqueeze(0).to(device)
-    sampled_token = None
-    sampled_token_list = tokens[0].tolist()
-    i = 0
-    while sampled_token != tokenizer.eos_token_id and i < self.max_seq_len:
-      logits = self.__run_model(tokens,None,position=i)[:,-1,:] / temp
-      if top_k == None:
-        probabilities = F.softmax(logits, dim=-1)
-        new_token = torch.argmax(probabilities,dim=-1).unsqueeze(0)
-      else:
-        indices_to_remove = logits < torch.topk(logits,k=top_k,dim=1)[0][..., -1, None]
-        logits[indices_to_remove] = float("-inf")
-        probabilities=F.softmax(logits/temp,dim=-1).squeeze(0)
-        new_token = torch.argmax(probabilities,dim=-1).unsqueeze(0)#torch.multinomial(probabilities,num_samples=1).unsqueeze(0)
-      
-      i = i + tokens.shape[1]
-      tokens = new_token
-      sampled_token = new_token.squeeze().item()
-      sampled_token_list.append(sampled_token)
+  
+  def generate(self, prompt, tokenizer, temp=1.0, top_k=None):
+      device = 'cuda'
+      tokenized = tokenizer(prompt, max_length=self.max_seq_len, truncation=True)
+      tokens = torch.tensor(tokenized['input_ids']).unsqueeze(0).to(device)
+      sampled_token = None
+      i = 0
+      while sampled_token != tokenizer.eos_token_id:
+          logits = self.__run_model(tokens, None)[:, -1, :] / temp
 
+          # Since logits might be in lower precision, convert them to float32 if necessary
+          probabilities = F.softmax(logits.float(), dim=-1)
 
-    sampled_token_list = sampled_token_list[:-1] if sampled_token == tokenizer.eos_token_id else sampled_token_list
-    return tokenizer.decode(sampled_token_list)
-  def generate2(self,prompt,tokenizer,temp=1.0,top_k=None):
-    device = 'cuda'
-    tokenized = tokenizer(prompt, max_length=self.max_seq_len,truncation=True)
-    tokens = torch.tensor(tokenized['input_ids']).unsqueeze(0).to(device)
-    sampled_token = None
-    i = 0
-    while sampled_token != tokenizer.eos_token_id and i < 128:
-     
-      logits = self.__run_model(tokens,None)[:,-1,:] / temp
+          new_token = torch.multinomial(probabilities,num_samples=1)
+          tokens = torch.cat((tokens, new_token), dim=1)
+          sampled_token = new_token.squeeze().item()
+          i += 1  # Increment the counter to prevent infinite loops
 
-      probabilities = F.softmax(logits, dim=-1)
-      new_token = torch.argmax(probabilities,dim=-1).unsqueeze(0)
-      tokens = torch.cat((tokens, new_token), dim=1)
-      sampled_token = new_token.squeeze().item()
+      tokens = tokens.squeeze().tolist()
+      tokens = tokens[:-1] if sampled_token == tokenizer.eos_token_id else tokens
+      return tokenizer.decode(tokens)
+  
+  def generate_k_v(self, prompt, tokenizer, temp=1.0, top_k=None):
+        device = 'cuda'
+        tokenized = tokenizer(prompt, max_length=self.max_seq_len, truncation=True)
+        tokens = torch.tensor(tokenized['input_ids']).unsqueeze(0).to(device)
+        sampled_token = None
+        sampled_tokens = tokens.squeeze(0).tolist()
 
+        i = 0
+        while i < 256:
+            logits = self.__run_model(tokens, None,position=i)[:, -1, :] / temp
 
-    tokens = tokens.squeeze().tolist()
-    tokens = tokens[:-1] if sampled_token == tokenizer.eos_token_id else tokens
-    return tokenizer.decode(tokens)
+            probabilities = F.softmax(logits.float(), dim=-1)
+            sampled_token = torch.multinomial(probabilities,num_samples=1)
+
+            tokens = sampled_token
+            if sampled_token.item() !=  tokenizer.eos_token_id:
+              sampled_tokens.append(sampled_token.item())
+            else:
+              break
+            i = len(sampled_tokens) 
+           
+
+        return tokenizer.decode(sampled_tokens)
     
+
   def __run_model(self,tgt,attention_mask,position=0):
-    causal_mask = Llama3._build_masks(tgt.shape[1],attention_mask,tgt.device) if self.training else None
+    causal_mask = self._build_masks(tgt.shape[1],attention_mask,tgt.device,position=position)
     tgt_embed = self.embedding(tgt)
     freqs_cis = self.freqs_cis[position:position + tgt_embed.shape[1]].to(tgt.device)
 
@@ -262,6 +264,9 @@ class Llama3(nn.Module):
   
   def forward(self,tgt,attention_mask,labels):
 
-    logits = self.__run_model(tgt,attention_mask)
+
    
+    logits = self.__run_model(tgt,attention_mask)
+    #print("-----")
+   #print(self.calc_loss(logits,labels))
     return self.calc_loss(logits,labels)

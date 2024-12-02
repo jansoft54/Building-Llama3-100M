@@ -2,7 +2,7 @@ import torch
 from datasets import load_dataset
 import tiktoken
 import math
-
+torch.set_printoptions(profile="full")
 from datasets import load_dataset
 from transformers import GPT2TokenizerFast
 from model import Llama3
@@ -19,7 +19,7 @@ logger = logging.getLogger()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 max_seq_len = 256
-batch_size = 18
+batch_size = 64
 n_batches = 10000
 # Load the dataset
 dataset = load_dataset("roneneldan/TinyStories", split="train")
@@ -37,7 +37,7 @@ tokenized_dataset = dataset.map(
     tokenize_function,
     batched=True,
     remove_columns=['text']
-).select(range(batch_size*n_batches))
+)#.select(range(batch_size*3*n_batches,batch_size*10*n_batches))
 print(f"Number of samples: {len(tokenized_dataset)}")
 from transformers import DataCollatorForLanguageModeling
 
@@ -56,13 +56,13 @@ dataloader = DataLoader(
 
 
 d_model=512
-heads=16
-num_layers=16
-group_size=4
+heads=8
+num_layers=8
+group_size=1
 
 warmup = 100
-lr = 1e-3
-min_lr = 1e-4
+lr =1e-4
+min_lr =7e-5
 
 class InverseSquareRootLR(torch.optim.lr_scheduler._LRScheduler):
     def __init__(self, optimizer, warmup_steps, init_lr, min_lr=1e-9, last_epoch=-1):
@@ -82,7 +82,7 @@ class InverseSquareRootLR(torch.optim.lr_scheduler._LRScheduler):
 
         return [lr for _ in self.base_lrs]
 
-epochs = 50
+epochs = 2
 
 model = Llama3(vocab_size=len(tokenizer),
                tokenizer=tokenizer,
@@ -92,10 +92,10 @@ model = Llama3(vocab_size=len(tokenizer),
                num_layers=num_layers,
                max_seq_len=max_seq_len,
                use_flash=True).to(device)
-#model.load_state_dict(torch.load('best_model_2.pth'))
-#model =  torch.compile(model)
-
-optim = torch.optim.AdamW(model.parameters(),lr=lr,betas=(0.9, 0.98),weight_decay=0.01 )
+model.load_state_dict(torch.load('tiny_stories_2.pth'))
+model =  torch.compile(model)
+model.train()
+optim = torch.optim.AdamW(model.parameters(),lr=lr,betas=(0.9, 0.999),weight_decay=0)
 lr_scheduler = InverseSquareRootLR(optim,warmup,lr,min_lr=min_lr)
 
 logger.info(f"Param. count: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
@@ -115,16 +115,16 @@ for epoch in range(epochs):
        
         scaler.scale(loss).backward()
 
-        # Optional: Unscale gradients and perform gradient clipping
         scaler.unscale_(optim)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        # Optimizer step with scaler
         scaler.step(optim)
         scaler.update()
+       # lr_scheduler.step()
 
         logger.info(f"Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(dataloader)}], Loss: {loss.item():.4f}")
-    torch.save(model.state_dict(), 'best_model_2.pth')
+        if (i+1) % 1000 == 0:
+            torch.save(model._orig_mod.state_dict(), 'tiny_stories_2.pth')
 
    
 

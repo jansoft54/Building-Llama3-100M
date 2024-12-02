@@ -1,5 +1,7 @@
 # LLaMA3-100M Clone
 
-<img src="llama3.webp" alt="Llama Illustration" width="300">
 
+<p align="center">
+  <img src="assets/llama3.webp" width="300" height="300" alt="Cute Llama">
+</p>
 **LLaMA3-100M** is a lightweight clone of the LLaMA3 language model, featuring 100 million parameters...
