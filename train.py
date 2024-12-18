@@ -19,7 +19,7 @@ logger = logging.getLogger()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 max_seq_len = 256
-batch_size = 64
+batch_size = 70
 n_batches = 10000
 # Load the dataset
 dataset = load_dataset("roneneldan/TinyStories", split="train")
@@ -55,9 +55,9 @@ dataloader = DataLoader(
 
 
 
-d_model=512
-heads=8
-num_layers=8
+d_model=256
+heads=16
+num_layers=16
 group_size=1
 
 warmup = 100
@@ -92,7 +92,7 @@ model = Llama3(vocab_size=len(tokenizer),
                num_layers=num_layers,
                max_seq_len=max_seq_len,
                use_flash=True).to(device)
-model.load_state_dict(torch.load('tiny_stories_2.pth'))
+#model.load_state_dict(torch.load('tiny_stories_2.pth'))
 model =  torch.compile(model)
 model.train()
 optim = torch.optim.AdamW(model.parameters(),lr=lr,betas=(0.9, 0.999),weight_decay=0)
@@ -124,7 +124,7 @@ for epoch in range(epochs):
 
         logger.info(f"Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(dataloader)}], Loss: {loss.item():.4f}")
         if (i+1) % 1000 == 0:
-            torch.save(model._orig_mod.state_dict(), 'tiny_stories_2.pth')
+            torch.save(model._orig_mod.state_dict(), 'tiny_stories_3.pth')
 
    
 
