@@ -31,23 +31,34 @@ The model can be trained using the standard PyTorch training loop. The following
 
 The `forward()` method calculates the cross-entropy loss given the target and labels.
 
-### Generation
-Llama3 supports two generation methods:
-- **Greedy Sampling (`generate()`)**: Takes a prompt and generates text until an end token is encountered or the maximum length is reached.
-- **Key-Value Generation (`generate_k_v()`)**: Generates text while keeping a key-value cache for efficient handling of long sequences.
-
 ## Example
 To use Llama3 for text generation, you can instantiate the model and use the `generate()` method:
 
 ```python
 # Example instantiation
-device = 'cuda'
-model = Llama3(vocab_size=50000, d_model=256, heads=4, group_size=2, num_layers=8, max_seq_len=256, tokenizer=my_tokenizer)
-model.to(device)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Generate text from a prompt
-prompt = "Once upon a time"
-generated_text = model.generate(prompt, my_tokenizer)
+tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+max_seq_len = 256
+args = ModelArgs(
+    vocab_size=len(tokenizer),
+    tokenizer=tokenizer,
+    d_model=256,
+    heads=4,
+    group_size=2,
+    num_layers=32,
+    max_seq_len=max_seq_len,
+    use_flash=True,
+)
+model = Llama3.from_pretrained("tiny_stories_50M.pth", args).to(device)
+model.eval()
+
+generated_text = model.generate_kv(
+    "There once was a strong man called Bene who liked to play on the computer.",
+    tokenizer=tokenizer,
+    top_p=0.8,
+)
 print(generated_text)
 ```
 
