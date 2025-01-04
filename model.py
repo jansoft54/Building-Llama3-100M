@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 
 device = "cuda"
 
@@ -122,10 +123,10 @@ class MultiHeadGQAttention(nn.Module):
 
         if MultiHeadGQAttention.flash:
             q, k, v = (x.contiguous() for x in (q, k, v))
+            if mask is not None:
+                mask = (mask == 1).unsqueeze(1)
             output = (
-                F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=(mask == 1).unsqueeze(1)
-                )
+                F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
                 .transpose(1, 2)
                 .reshape(bs, seq_len, -1)
             )
@@ -134,13 +135,13 @@ class MultiHeadGQAttention(nn.Module):
             if mask is not None:
                 mask = mask.unsqueeze(1)
                 scores = torch.masked_fill(scores, mask == 0, float("-inf"))
-                attention = nn.functional.softmax(scores, dim=-1)
-                output = (
-                    torch.matmul(attention, v)
-                    .transpose(1, 2)
-                    .contiguous()
-                    .view(bs, seq_len, -1)
-                )
+            attention = nn.functional.softmax(scores, dim=-1)
+            output = (
+                torch.matmul(attention, v)
+                .transpose(1, 2)
+                .contiguous()
+                .view(bs, seq_len, -1)
+            )
 
         output = self.W_o(output)
         return output
@@ -166,16 +167,15 @@ class DecoderLayer(nn.Module):
 
 @dataclass
 class ModelArgs:
-    d_model: int = 256
     vocab_size: int
-
-    heads: int
-    group_size: int = (2,)
-    num_layers: int = (8,)
-    max_seq_len: int = (256,)
-    tokenizer: any
-    ignore_index: int = (-100,)
-    use_flash: bool = (False,)
+    d_model: int = 256
+    heads: int = 4
+    group_size: int = 2
+    num_layers: int = 8
+    max_seq_len: int = 256
+    tokenizer: any = None
+    ignore_index: int = -100
+    use_flash: bool = False
 
 
 class Llama3(nn.Module):
@@ -199,7 +199,9 @@ class Llama3(nn.Module):
         self.embedding = nn.Embedding(params.vocab_size, params.d_model)
         self.norm = nn.RMSNorm(params.d_model, eps=1e-6)
         self.ffn = nn.Linear(params.d_model, params.vocab_size, bias=False)
-
+        self.group_size = params.group_size
+        self.d_model = params.d_model
+        self.heads = params.heads
         self.d_k = params.d_model // params.heads
         self.freqs_cis = RoPE.compute_freq(
             head_dim=params.d_model // params.heads, seq_len=params.max_seq_len
@@ -209,33 +211,34 @@ class Llama3(nn.Module):
         MultiHeadGQAttention.flash = params.use_flash
 
     @staticmethod
-    def from_pretrained(checkpoint, params: ModelArgs) -> Llama3:
+    def from_pretrained(checkpoint, params: ModelArgs) -> "Llama3":
 
         model = Llama3(params).to(device)
-        model.load_state_dict(checkpoint)
+        model.load_state_dict(torch.load(checkpoint))
         return model
 
-    def _build_masks(self, seq_len, attention_mask, device, position=0):
-        causal = (
-            torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
-            .to(device)
-            .unsqueeze(0)
-        )
-        if not self.training:
+    @staticmethod
+    def build_masks(seq_len, attention_mask, device, position=0, training=False):
+        causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool)).unsqueeze(0)
+
+        if not training:
             i = torch.arange(seq_len).unsqueeze(1)  # Shape: (seqlen, 1)
             j = torch.arange(position + seq_len).unsqueeze(
                 0
             )  # Shape: (1, cache_len + seqlen)
             return (j <= (position + i)).int().unsqueeze(0).to(device)
+
         if attention_mask == None:
             return causal
         attention_mask = attention_mask.unsqueeze(1).repeat(1, seq_len, 1).int()
+
         return (causal & attention_mask).int()
 
     @staticmethod
     def gen_labels(labels, tokenizer, data_collator, ignore_index=-100):
         batch = data_collator(labels)
         labels = batch["labels"]
+        attention_mask = batch["attention_mask"]
         for i in range(labels.shape[0]):
             l = torch.roll(labels[i], -1)
             target_indices = (l == ignore_index).nonzero(as_tuple=True)[0]
@@ -245,8 +248,14 @@ class Llama3(nn.Module):
                 seq_len = len(l) - len(target_indices)
                 l[-1] = ignore_index
                 l[seq_len - 1] = tokenizer.eos_token_id
+
             labels[i] = l
+
         batch["labels"] = labels
+        batch["attention_mask"] = Llama3.build_masks(
+            labels.shape[1], attention_mask, device, training=True
+        )
+
         return batch
 
     def calc_loss(self, logits, labels):
@@ -257,59 +266,35 @@ class Llama3(nn.Module):
         )
         return loss
 
-    def generate_(self, prompt, tokenizer, temp=1.0, top_k=None):
-        device = "cuda"
-        tokenized = tokenizer(prompt, max_length=self.max_seq_len, truncation=True)
-        tokens = torch.tensor(tokenized["input_ids"]).unsqueeze(0).to(device)
-        sampled_token = None
-        i = 0
-
-        while sampled_token != tokenizer.eos_token_id:
-            logits = self.__run_model(tokens, None)[:, -1, :] / temp
-
-            # Since logits might be in lower precision, convert them to float32 if necessary
-            probabilities = F.softmax(logits.float(), dim=-1)
-            if top_k is not None:
-                topk_probs, _ = torch.topk(probabilities, top_k)
-                probabilities = torch.where(
-                    probabilities < topk_probs.squeeze(0)[-1], 0, probabilities
-                )
-                new_token = torch.multinomial(
-                    probabilities / probabilities.sum(), num_samples=1
-                )
-
-            else:
-                new_token = torch.multinomial(probabilities, num_samples=1)
-
-            new_token = torch.multinomial(probabilities, num_samples=1)
-            tokens = torch.cat((tokens, new_token), dim=1)
-            sampled_token = new_token.squeeze().item()
-            i += 1  # Increment the counter to prevent infinite loops
-
-        tokens = tokens.squeeze().tolist()
-        tokens = tokens[:-1] if sampled_token == tokenizer.eos_token_id else tokens
-        return tokenizer.decode(tokens)
-
     @torch.inference_mode
-    def generate_kv(self, prompt, tokenizer, temp=1.0, top_k=None):
+    def generate_kv(self, prompt, tokenizer, temp=1.0, top_k=None, top_p=None):
         device = "cuda"
         tokenized = tokenizer(prompt, max_length=self.max_seq_len, truncation=True)
         tokens = torch.tensor(tokenized["input_ids"]).unsqueeze(0).to(device)
         sampled_token = None
         sampled_tokens = tokens.squeeze(0).tolist()
 
+        token_len = tokens.shape[1]
+
+        mask = (
+            torch.tril(torch.ones(token_len, token_len, dtype=torch.bool))
+            .unsqueeze(0)
+            .to(device)
+        )
+
         i = 0
         for block in self.layers:
             block.attention.cache = KV_Cache(
-                batch_size=4,
+                batch_size=1,
                 seq_length=self.max_seq_len,
                 n_kv_heads=self.heads // self.group_size,
                 head_dim=self.d_model // self.heads,
             )
 
         while i < self.max_seq_len:
-            logits = self.__run_model(tokens, None, position=i)[:, -1, :] / temp
-            probabilities = F.softmax(logits.float(), dim=-1)
+
+            logits = self.__run_model(tokens, mask, position=i)[:, -1, :] / temp
+            probabilities = F.softmax(logits.float(), dim=-1).squeeze()
             if top_k is not None:
                 topk_probs, _ = torch.topk(probabilities, top_k)
                 probabilities = torch.where(
@@ -318,30 +303,42 @@ class Llama3(nn.Module):
                 sampled_token = torch.multinomial(
                     probabilities / probabilities.sum(), num_samples=1
                 )
+            elif top_p is not None:
+                sorted_probs, sorted_indices = torch.sort(
+                    probabilities, descending=True
+                )
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                cutoff_index = torch.searchsorted(cumulative_probs, top_p, right=True)
 
+                sorted_probs[cutoff_index + 1 :] = 0
+                sorted_probs = sorted_probs / sorted_probs.sum()
+                probabilities = torch.zeros_like(probabilities).scatter(
+                    0, sorted_indices, sorted_probs
+                )
+
+                sampled_token = torch.multinomial(probabilities, num_samples=1)
             else:
                 sampled_token = torch.multinomial(probabilities, num_samples=1)
 
-            tokens = sampled_token
+            tokens = sampled_token.unsqueeze(0)
             if sampled_token.item() != tokenizer.eos_token_id:
                 sampled_tokens.append(sampled_token.item())
             else:
                 break
             i = len(sampled_tokens)
+            mask = None
 
         return tokenizer.decode(sampled_tokens)
 
     def __run_model(self, tgt, attention_mask, position=0):
-        causal_mask = self._build_masks(
-            tgt.shape[1], attention_mask, tgt.device, position=position
-        )
+
         tgt_embed = self.embedding(tgt)
         freqs_cis = self.freqs_cis[position : position + tgt_embed.shape[1]].to(
             tgt.device
         )
 
         for i in range(self.num_layers):
-            tgt_embed = self.layers[i](tgt_embed, causal_mask, position, freqs_cis)
+            tgt_embed = self.layers[i](tgt_embed, attention_mask, position, freqs_cis)
         return self.ffn(self.norm(tgt_embed))
 
     def forward(self, tgt, attention_mask, labels):
